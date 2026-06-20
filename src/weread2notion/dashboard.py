@@ -48,14 +48,23 @@ def _get_token():
 
 
 def _get_proxies():
-    """Return proxy dict when NO_PROXY=* is set, otherwise None.
+    """Return proxy config for requests library.
 
-    When NO_PROXY=* (or no_proxy=*) is present the caller wants to bypass
-    all proxies, so we return explicit None mappings.  Otherwise we return
-    None so that ``requests`` picks up HTTP_PROXY / HTTPS_PROXY automatically.
+    * When NO_PROXY=* is set the caller wants to bypass all proxies,
+      so we return explicit None mappings.
+    * When HTTP_PROXY / HTTPS_PROXY are set, return them explicitly so
+      ``requests`` doesn't have issues with TLS proxy connections.
+    * Otherwise return None so ``requests`` uses its default behaviour.
     """
     if os.environ.get("NO_PROXY") == "*" or os.environ.get("no_proxy") == "*":
         return {"http": None, "https": None}
+    http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
+    https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    if http_proxy or https_proxy:
+        return {
+            "http": http_proxy or None,
+            "https": https_proxy or None,
+        }
     return None
 
 
@@ -284,14 +293,13 @@ def create_notes_database(parent_page_id):
 
 
 def ensure_library(parent_page_id):
-    """Main entry point: ensure both library databases exist.
+    """Main entry point: ensure the books database exists.
 
     1. Loads persisted state from ``sync_state.json``.
     2. Creates the books database if no ID is stored.
-    3. Creates the notes database if no ID is stored.
-    4. Saves state after any creation so IDs are reused on subsequent runs.
+    3. Saves state after creation so the ID is reused on subsequent runs.
 
-    Returns ``(books_db_id, notes_db_id)``.
+    Returns ``books_db_id``.
     """
     state = load_state()
 
@@ -301,15 +309,8 @@ def ensure_library(parent_page_id):
         state["books_db_id"] = books_db_id
         save_state(state)
 
-    notes_db_id = state.get("notes_db_id")
-    if not notes_db_id:
-        notes_db_id = create_notes_database(parent_page_id)
-        state["notes_db_id"] = notes_db_id
-        save_state(state)
-
     print("[Library] Books DB: " + books_db_id)
-    print("[Library] Notes DB: " + notes_db_id)
-    return books_db_id, notes_db_id
+    return books_db_id
 
 
 # ── Property Helpers ──────────────────────────────────────────────────────

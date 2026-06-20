@@ -1,4 +1,4 @@
-def get_heading(level, content):
+def get_heading(level, content, toggleable=False):
     if level == 1:
         heading = "heading_1"
     elif level == 2:
@@ -17,7 +17,7 @@ def get_heading(level, content):
                 }
             ],
             "color": "default",
-            "is_toggleable": False,
+            "is_toggleable": toggleable,
         },
     }
 

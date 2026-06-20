@@ -20,24 +20,20 @@ from .blocks import (
     get_rich_text,
     get_select,
     get_status,
+    get_table_of_contents,
     get_title,
     get_url,
 )
 from .dashboard import (
-    BOOKMARK_TYPE,
-    NOTE_TYPE,
-    REVIEW_TYPE,
     ensure_library,
     get_property_schema,
     build_book_properties,
     delete_old_book_pages,
     query_books_db,
-    sync_notes_to_db,
 )
 
 client = None
 books_db_id = None
-notes_db_id = None
 weread = None
 
 load_dotenv()
@@ -369,6 +365,8 @@ def get_children(chapter, summary, bookmark_list):
             all_chapters.append(item)
         all_chapters.sort(key=lambda x: x.get("chapterIdx", 0))
     chapter_nodes = {node.get("chapterUid"): node for node in all_chapters}
+    # Add table of contents at the top
+    children.append(get_table_of_contents())
 
     def get_ancestor_chain(current_chapter_info):
         if not current_chapter_info:
@@ -434,7 +432,8 @@ def get_children(chapter, summary, bookmark_list):
                 for chapter_node in path[divergence_index:]:
                     children.append(
                         get_heading(
-                            chapter_node.get("level"), chapter_node.get("title")
+                            chapter_node.get("level"), chapter_node.get("title"),
+                            toggleable=True,
                         )
                     )
                 previous_path_uids = [node.get("chapterUid") for node in path]
@@ -471,7 +470,7 @@ def get_children(chapter, summary, bookmark_list):
                     )
                 )
     if summary != None and len(summary) > 0:
-        children.append(get_heading(1, "\u70b9\u8bc4"))
+        children.append(get_heading(1, "\u70b9\u8bc4", toggleable=True))
         for i in summary:
             content = (i.get("review") or {}).get("content") or ""
             if not content:
@@ -564,7 +563,7 @@ def normalize_date_value(value):
 
 
 def ensure_library_setup():
-    global books_db_id, notes_db_id
+    global books_db_id
     parent_page = os.getenv("NOTION_PAGE", "")
     if not parent_page:
         fail_config("\u7f3a\u5c11 NOTION_PAGE\uff0c\u8bf7\u5728 .env \u4e2d\u914d\u7f6e")
@@ -574,9 +573,8 @@ def ensure_library_setup():
         parent_page_id = match.group(0)
     else:
         fail_config("NOTION_PAGE \u683c\u5f0f\u4e0d\u6b63\u786e")
-    books_db_id, notes_db_id = ensure_library(parent_page_id)
+    books_db_id = ensure_library(parent_page_id)
     print("Books DB: " + books_db_id)
-    print("Notes DB: " + notes_db_id)
 
 
 def get_latest_sort():
@@ -596,7 +594,7 @@ def get_latest_sort():
 
 
 def sync():
-    global client, books_db_id, notes_db_id, weread
+    global client, books_db_id, weread
     secrets = validate_secret_inputs()
     notion_token = secrets["notion_token"]
     weread = WeReadGatewayClient(secrets["weread_api_key"])
@@ -609,7 +607,6 @@ def sync():
     ensure_library_setup()
     latest_sort = get_latest_sort()
     books = get_notebooklist()
-    all_notes = []
     if books != None:
         for index, book in enumerate(books):
             sort = book["sort"]
@@ -643,72 +640,6 @@ def sync():
             results = add_children(id, children)
             if len(grandchild) > 0 and results != None:
                 add_grandchild(grandchild, results)
-
-            # \u2500\u2500 Collect notes for the dashboard \u2500\u2500
-            book_weread_url = "https://weread.qq.com/web/reader/" + calculate_book_str_id(bookId)
-            book_reading_progress = None
-            try:
-                read_info = get_read_info(bookId)
-                book_reading_progress = read_info.get("readingProgress")
-            except Exception:
-                pass
-
-            book_categories = categories or []
-
-            # Collect bookmarks (\u5212\u7ebf)
-            for bm in bookmark_list:
-                mark_text = bm.get("markText") or ""
-                if not mark_text:
-                    continue
-                chapter_uid = bm.get("chapterUid", 1)
-                ch_info = None
-                if chapter:
-                    ch_info = chapter.get(chapter_uid) or chapter.get(str(chapter_uid))
-                chapter_title = ch_info.get("title", "") if ch_info else ""
-                is_note = bm.get("_callout_icon") == NOTE_CALLOUT_ICON
-                note_type = NOTE_TYPE if is_note else BOOKMARK_TYPE
-
-                all_notes.append({
-                    "bookId": bookId,
-                    "bookName": title,
-                    "author": author,
-                    "categories": book_categories,
-                    "chapterTitle": chapter_title,
-                    "noteType": note_type,
-                    "markText": mark_text,
-                    "abstract": bm.get("abstract", ""),
-                    "wereadUrl": book_weread_url,
-                    "readingProgress": book_reading_progress,
-                })
-
-            # Collect summary/reviews (\u70b9\u8bc4)
-            if summary:
-                for s in summary:
-                    content = (s.get("review") or {}).get("content") or ""
-                    if not content:
-                        continue
-                    all_notes.append({
-                        "bookId": bookId,
-                        "bookName": title,
-                        "author": author,
-                        "categories": book_categories,
-                        "chapterTitle": "",
-                        "noteType": REVIEW_TYPE,
-                        "markText": content,
-                        "abstract": "",
-                        "wereadUrl": book_weread_url,
-                        "readingProgress": book_reading_progress,
-                    })
-
-    # \u2500\u2500 Sync notes to the notes database \u2500\u2500
-    print("")
-    print("=" * 44)
-    print("Syncing notes to database...")
-    print("=" * 44)
-    try:
-        sync_notes_to_db(notes_db_id, all_notes)
-    except Exception as e:
-        print("[NotesDB] Error: " + str(e))
 
 
 def main(argv=None):

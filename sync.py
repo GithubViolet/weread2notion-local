@@ -24,6 +24,9 @@ if detect_proxy():
     os.environ['HTTPS_PROXY'] = proxy_url
     os.environ['http_proxy'] = proxy_url
     os.environ['https_proxy'] = proxy_url
+    # Clear NO_PROXY so requests actually uses the proxy
+    os.environ.pop('NO_PROXY', None)
+    os.environ.pop('no_proxy', None)
     proxy_status = 'ON (127.0.0.1:7890)'
 else:
     os.environ['NO_PROXY'] = '*'
