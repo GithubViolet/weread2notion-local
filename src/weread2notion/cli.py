@@ -354,9 +354,20 @@ def get_notebooklist():
     return books
 
 
+def _build_callout(item):
+    """Build a callout block from a bookmark/review item, with optional
+    nested quote child.  Returns the callout block dict."""
+    markText = item.get("markText") or ""
+    callout_icon = item.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
+    callout = get_callout(markText, icon=callout_icon)
+    abstract = item.get("abstract")
+    if abstract:
+        callout["callout"]["children"] = [get_quote(abstract)]
+    return callout
+
+
 def get_children(chapter, summary, bookmark_list):
     children = []
-    grandchild = {}
     all_chapters = []
     if chapter:
         for uid, info in chapter.items():
@@ -429,60 +440,79 @@ def get_children(chapter, summary, bookmark_list):
                         break
                     divergence_index += 1
 
-                for chapter_node in path[divergence_index:]:
+                # Ancestor headings (non-toggleable)
+                for chapter_node in path[divergence_index:-1]:
                     children.append(
                         get_heading(
                             chapter_node.get("level"), chapter_node.get("title"),
-                            toggleable=True,
+                            toggleable=False,
                         )
                     )
+
+                # Current chapter heading (toggleable) with nested callouts
+                leaf = path[-1]
+                heading_block = get_heading(
+                    leaf.get("level"), leaf.get("title"),
+                    toggleable=True,
+                )
+                heading_children = []
+                for bm in group["bookmarks"]:
+                    markText = bm.get("markText") or ""
+                    if not markText:
+                        continue
+                    if len(markText) > 2000:
+                        # Split long text into multiple callouts
+                        for j in range(0, len(markText) // 2000 + 1):
+                            chunk = markText[j * 2000 : (j + 1) * 2000]
+                            icon = bm.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
+                            heading_children.append(get_callout(chunk, icon=icon))
+                    else:
+                        heading_children.append(_build_callout(bm))
+
+                if heading_children:
+                    heading_block[heading_block["type"]]["children"] = heading_children
+                children.append(heading_block)
                 previous_path_uids = [node.get("chapterUid") for node in path]
             else:
                 previous_path_uids = []
-
-            for i in group["bookmarks"]:
-                markText = i.get("markText") or ""
-                if not markText:
-                    continue
-                callout_icon = i.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
-                for j in range(0, len(markText) // 2000 + 1):
-                    children.append(
-                        get_callout(
-                            markText[j * 2000 : (j + 1) * 2000],
-                            icon=callout_icon,
-                        )
-                    )
-                if i.get("abstract") != None and i.get("abstract") != "":
-                    quote = get_quote(i.get("abstract"))
-                    grandchild[len(children) - 1] = quote
+                # No chapter info — add callouts directly
+                for bm in group["bookmarks"]:
+                    markText = bm.get("markText") or ""
+                    if not markText:
+                        continue
+                    heading_children = []
+                    heading_children.append(_build_callout(bm))
+                    for c in heading_children:
+                        children.append(c)
 
     else:
-        # \u5982\u679c\u6ca1\u6709\u7ae0\u8282\u4fe1\u606f
+        # No chapter information — add callouts at top level
         for data in bookmark_list:
             markText = data.get("markText") or ""
             if not markText:
                 continue
-            for i in range(0, len(markText) // 2000 + 1):
-                children.append(
-                    get_callout(
-                        markText[i * 2000 : (i + 1) * 2000],
-                        icon=BOOKMARK_CALLOUT_ICON,
-                    )
-                )
+            children.append(_build_callout(data))
+
+    # Reviews / 点评 section
     if summary != None and len(summary) > 0:
-        children.append(get_heading(1, "\u70b9\u8bc4", toggleable=True))
+        review_heading = get_heading(1, "\u70b9\u8bc4", toggleable=True)
+        review_children = []
         for i in summary:
             content = (i.get("review") or {}).get("content") or ""
             if not content:
                 continue
             for j in range(0, len(content) // 2000 + 1):
-                children.append(
+                review_children.append(
                     get_callout(
                         content[j * 2000 : (j + 1) * 2000],
                         icon=NOTE_CALLOUT_ICON,
                     )
                 )
-    return children, grandchild
+        if review_children:
+            review_heading[review_heading["type"]]["children"] = review_children
+        children.append(review_heading)
+
+    return children, {}
 
 
 def transform_id(book_id):
