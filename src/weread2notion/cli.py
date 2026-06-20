@@ -30,6 +30,7 @@ from .dashboard import (
     delete_old_book_pages,
     query_books_db,
     rename_page,
+    set_page_open_full_page,
 )
 
 client = None
@@ -370,15 +371,16 @@ def _build_callout(item):
     return callout
 
 
-def _build_chapter_table(all_chapters, bookmark_list):
-    """Build a Notion table block showing ALL chapters with note/highlight counts.
+def _build_chapter_table(all_chapters, bookmark_list, page_ids=None):
+    """Build a 3-column table: 标题 | 笔记 | 划线.
 
-    Returns a table block dict, or None if there are no data rows.
+    *page_ids* maps chapterUid → child page ID for clickable title cells.
     """
     if not all_chapters:
         return None
+    if page_ids is None:
+        page_ids = {}
 
-    # Count notes and bookmarks per chapterUid
     note_counts = {}
     mark_counts = {}
     for item in bookmark_list:
@@ -389,7 +391,6 @@ def _build_chapter_table(all_chapters, bookmark_list):
             mark_counts[uid] = mark_counts.get(uid, 0) + 1
 
     header_cells = [
-        [{"type": "text", "text": {"content": "\u7ae0\u8282"}}],
         [{"type": "text", "text": {"content": "\u6807\u9898"}}],
         [{"type": "text", "text": {"content": "\u7b14\u8bb0"}}],
         [{"type": "text", "text": {"content": "\u5212\u7ebf"}}],
@@ -402,7 +403,6 @@ def _build_chapter_table(all_chapters, bookmark_list):
         uid = ch.get("chapterUid")
         level = ch.get("level", 1)
         title = ch.get("title", "")
-
         n_notes = note_counts.get(uid, 0)
         n_marks = mark_counts.get(uid, 0)
 
@@ -411,13 +411,21 @@ def _build_chapter_table(all_chapters, bookmark_list):
         if title in skip_titles and n_notes == 0 and n_marks == 0:
             continue
 
-        prefix = "  " * (level - 1)
         notes_text = str(n_notes) if n_notes > 0 else "-"
         marks_text = str(n_marks) if n_marks > 0 else "-"
 
+        # Title cell: page mention if child page exists, else plain text
+        page_id = page_ids.get(uid)
+        if page_id:
+            title_cell = [{
+                "type": "mention",
+                "mention": {"type": "page", "page": {"id": page_id}},
+            }]
+        else:
+            title_cell = [{"type": "text", "text": {"content": title}}]
+
         row_cells = [
-            [{"type": "text", "text": {"content": prefix + str(len(data_rows) + 1)}}],
-            [{"type": "text", "text": {"content": title}}],
+            title_cell,
             [{"type": "text", "text": {"content": notes_text}}],
             [{"type": "text", "text": {"content": marks_text}}],
         ]
@@ -430,7 +438,7 @@ def _build_chapter_table(all_chapters, bookmark_list):
     return {
         "type": "table",
         "table": {
-            "table_width": 4,
+            "table_width": 3,
             "has_column_header": True,
             "has_row_header": False,
             "children": all_rows,
@@ -438,17 +446,16 @@ def _build_chapter_table(all_chapters, bookmark_list):
     }
 
 
-def get_children(chapter, summary, bookmark_list):
-    """Build all blocks for a book page.
+def get_children(chapter, summary, bookmark_list, child_page_ids=None):
+    """Build blocks for a book page: overview table + reviews.
 
-    Returns a list of Notion block dicts containing:
-    1. Chapter overview table (all chapters with note/highlight counts)
-    2. Toggleable headings for chapters with notes (expand to see callouts)
-    3. Reviews section (optional toggleable heading)
+    Chapter notes live inside child pages (created separately), NOT as
+    inline blocks — so there is nothing redundant below the table.
     """
+    if child_page_ids is None:
+        child_page_ids = {}
     children = []
 
-    # ── Prepare sorted chapter list ────────────────────────────────────
     all_chapters = []
     if chapter:
         for uid, info in chapter.items():
@@ -457,89 +464,10 @@ def get_children(chapter, summary, bookmark_list):
             all_chapters.append(item)
         all_chapters.sort(key=lambda x: x.get("chapterIdx", 0))
 
-    # ── Compute sequential display index for each chapterUid ───────────
-    skip_titles = {"\u7248\u6743\u4fe1\u606f", "\u6587\u524d", "\u63d2\u56fe"}
-    note_counts = {}
-    mark_counts = {}
-    for item in bookmark_list:
-        uid = item.get("chapterUid", 1)
-        if item.get("_callout_icon"):
-            note_counts[uid] = note_counts.get(uid, 0) + 1
-        else:
-            mark_counts[uid] = mark_counts.get(uid, 0) + 1
-
-    chapter_display_index = {}
-    display_idx = 0
-    for ch in all_chapters:
-        level = ch.get("level", 1)
-        title = ch.get("title", "")
-        uid = ch.get("chapterUid")
-        n_notes = note_counts.get(uid, 0)
-        n_marks = mark_counts.get(uid, 0)
-        # Same skip logic as _build_chapter_table for consistent numbering
-        if level == 0:
-            continue
-        if title in skip_titles and n_notes == 0 and n_marks == 0:
-            continue
-        display_idx += 1
-        chapter_display_index[uid] = display_idx
-
-    # ── Chapter overview table ──────────────────────────────────────────
-    chapter_table = _build_chapter_table(all_chapters, bookmark_list)
+    chapter_table = _build_chapter_table(all_chapters, bookmark_list, child_page_ids)
     if chapter_table:
         children.append(chapter_table)
 
-    # ── Toggleable headings with notes ──────────────────────────────────
-    if chapter and bookmark_list:
-        # Group bookmarks by chapterUid (preserve sorted order)
-        grouped = {}
-        group_order = []
-        for bm in bookmark_list:
-            uid = bm.get("chapterUid", 1)
-            if uid not in grouped:
-                grouped[uid] = []
-                group_order.append(uid)
-            grouped[uid].append(bm)
-
-        for uid in group_order:
-            info = (chapter.get(uid)
-                    or chapter.get(str(uid))
-                    or chapter.get(int(uid) if isinstance(uid, str) and uid.isdigit() else None))
-            if not info:
-                continue
-            ch_title = info.get("title", "")
-            level = info.get("level", 1)
-
-            # Build heading text with correct sequential number
-            disp_idx = chapter_display_index.get(uid, "")
-            if disp_idx and ch_title:
-                heading_text = "\u7b2c{}\u7ae0 {}".format(disp_idx, ch_title)
-            elif ch_title:
-                heading_text = ch_title
-            else:
-                heading_text = "\u7ae0\u8282 {}".format(uid)
-
-            heading_block = get_heading(level, heading_text, toggleable=True)
-
-            # Build callout blocks nested inside the heading
-            heading_children = []
-            for bm in grouped[uid]:
-                markText = bm.get("markText") or ""
-                if not markText:
-                    continue
-                if len(markText) > 2000:
-                    for j in range(0, len(markText) // 2000 + 1):
-                        chunk = markText[j * 2000 : (j + 1) * 2000]
-                        icon = bm.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
-                        heading_children.append(get_callout(chunk, icon=icon))
-                else:
-                    heading_children.append(_build_callout(bm))
-
-            if heading_children:
-                heading_block[heading_block["type"]]["children"] = heading_children
-            children.append(heading_block)
-
-    # ── Reviews / 点评 ──────────────────────────────────────────────────
     if summary is not None and len(summary) > 0:
         review_heading = get_heading(1, "\u70b9\u8bc4", toggleable=True)
         review_children = []
@@ -549,16 +477,70 @@ def get_children(chapter, summary, bookmark_list):
                 continue
             for j in range(0, len(content) // 2000 + 1):
                 review_children.append(
-                    get_callout(
-                        content[j * 2000 : (j + 1) * 2000],
-                        icon=NOTE_CALLOUT_ICON,
-                    )
+                    get_callout(content[j * 2000 : (j + 1) * 2000], icon=NOTE_CALLOUT_ICON)
                 )
         if review_children:
             review_heading[review_heading["type"]]["children"] = review_children
         children.append(review_heading)
 
     return children
+
+
+def build_child_pages_data(chapter, bookmark_list):
+    """Group bookmarks by chapter and build child page descriptors.
+
+    Child page titles use the original chapter title text only — no
+    sequential numbers or chapterUid, to avoid confusion.
+    """
+    child_pages_data = []
+    bookmarks_by_chapter = {}
+    for data in bookmark_list:
+        uid = data.get("chapterUid", 1)
+        bookmarks_by_chapter.setdefault(uid, []).append(data)
+
+    for uid, bookmarks in bookmarks_by_chapter.items():
+        info = None
+        if chapter:
+            info = chapter.get(uid) or chapter.get(str(uid))
+        ch_title = info.get("title", "") if info else ""
+        page_title = ch_title if ch_title else "\u7ae0\u8282 {}".format(uid)
+
+        blocks = []
+        for bm in bookmarks:
+            markText = bm.get("markText") or ""
+            if not markText:
+                continue
+            if len(markText) > 2000:
+                for j in range(0, len(markText) // 2000 + 1):
+                    chunk = markText[j * 2000 : (j + 1) * 2000]
+                    icon = bm.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
+                    blocks.append(get_callout(chunk, icon=icon))
+            else:
+                blocks.append(_build_callout(bm))
+
+        if blocks:
+            child_pages_data.append({"title": page_title, "blocks": blocks, "uid": uid})
+
+    return child_pages_data
+
+
+def create_chapter_child_pages(book_page_id, child_pages_data):
+    """Create child pages and return ``{uid: page_id}`` mapping."""
+    page_ids = {}
+    for cp in child_pages_data:
+        time.sleep(0.5)
+        try:
+            resp = client.pages.create(
+                parent={"page_id": book_page_id},
+                properties={"title": {"title": [{"type": "text", "text": {"content": cp["title"]}}]}},
+                children=cp["blocks"],
+            )
+            page_ids[cp["uid"]] = resp["id"]
+        except Exception as e:
+            print("  Failed to create chapter page '{}': {}".format(cp["title"], e))
+    if page_ids:
+        print("  Created {} chapter pages".format(len(page_ids)))
+    return page_ids
 
 
 def transform_id(book_id):
@@ -652,6 +634,7 @@ def ensure_library_setup():
     # Rename parent page to "个人图书馆"
     rename_page(parent_page_id, "\u4e2a\u4eba\u56fe\u4e66\u9986")
     books_db_id = ensure_library(parent_page_id)
+    set_page_open_full_page(books_db_id)
     print("Books DB: " + books_db_id)
 
 
@@ -714,7 +697,9 @@ def sync():
                 bookmark_list,
                 key=lambda x: get_note_sort_key(x, chapter),
             )
-            children = get_children(chapter, summary, bookmark_list)
+            child_pages_data = build_child_pages_data(chapter, bookmark_list)
+            child_page_ids = create_chapter_child_pages(id, child_pages_data)
+            children = get_children(chapter, summary, bookmark_list, child_page_ids)
             add_children(id, children)
 
 

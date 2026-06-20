@@ -445,6 +445,47 @@ def query_books_db(books_db_id, filter_body=None, sort_body=None, page_size=100)
     return {"results": all_results}
 
 
+def set_page_open_full_page(books_db_id):
+    """Attempt to set the database view's page_open to 'full_page'.
+
+    The Notion public API does not officially support view updates,
+    but we try the internal-style endpoint as a best-effort.  If it
+    fails we silently skip — the user can change it manually.
+    """
+    try:
+        db_info = _api("GET", "/databases/" + books_db_id)
+    except Exception:
+        return
+
+    views = db_info.get("views", [])
+    if not views:
+        # Also try to discover views through child blocks
+        try:
+            children = _api("GET", "/blocks/" + books_db_id + "/children",
+                            params={"page_size": 100})
+            for block in children.get("results", []):
+                if block.get("type") == "collection_view":
+                    views.append(block)
+        except Exception:
+            pass
+
+    for view in views:
+        vid = view.get("id", "")
+        vformat = view.get("format", {}) or {}
+        if vformat.get("page_open") == "full_page":
+            continue
+        new_format = dict(vformat)
+        new_format["page_open"] = "full_page"
+        try:
+            _api("PATCH",
+                 "/databases/" + books_db_id + "/views/" + vid,
+                 {"format": new_format})
+            print("[View] Set page_open=full_page for '{}'".format(
+                view.get("name", vid)))
+        except Exception:
+            pass  # API might not support this — acceptable
+
+
 # ── Note Operations ───────────────────────────────────────────────────────
 
 
