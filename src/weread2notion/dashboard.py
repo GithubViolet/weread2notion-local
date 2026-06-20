@@ -208,13 +208,16 @@ def _books_db_schema():
         "状态": {
             "status": {
                 "options": [
-                    {"name": "想读", "color": "default"},
+                    {"name": "未读", "color": "default"},
                     {"name": "在读", "color": "blue"},
                     {"name": "读完", "color": "green"},
                 ]
             }
         },
         "阅读进度": {"number": {"format": "percent"}},
+        "阅读时长": {"number": {}},
+        "日期": {"date": {}},
+        "封面": {"files": {}},
     }
 
 
@@ -313,6 +316,25 @@ def ensure_library(parent_page_id):
     return books_db_id
 
 
+# ── Page Renaming ────────────────────────────────────────────────────────
+
+
+def rename_page(page_id, new_title):
+    """Rename a Notion page to *new_title* via the API."""
+    body = {
+        "properties": {
+            "title": {
+                "title": [{"type": "text", "text": {"content": new_title}}]
+            }
+        }
+    }
+    try:
+        _api("PATCH", "/pages/" + page_id, body)
+        print("[Page] Renamed to: " + new_title)
+    except Exception as exc:
+        print("[Page] Rename failed: " + str(exc))
+
+
 # ── Property Helpers ──────────────────────────────────────────────────────
 
 
@@ -353,6 +375,16 @@ def build_book_properties(raw_props):
                 }
         elif prop_type == "status":
             properties[name] = {"status": {"name": str(value)}}
+        elif prop_type == "date":
+            if isinstance(value, str):
+                properties[name] = {"date": {"start": value}}
+            elif isinstance(value, dict):
+                properties[name] = {"date": value}
+        elif prop_type == "files":
+            if isinstance(value, str) and value.startswith("http"):
+                properties[name] = {
+                    "files": [{"type": "external", "name": "Cover", "external": {"url": value}}]
+                }
 
     return properties
 

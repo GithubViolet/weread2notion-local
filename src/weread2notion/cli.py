@@ -30,6 +30,7 @@ from .dashboard import (
     build_book_properties,
     delete_old_book_pages,
     query_books_db,
+    rename_page,
 )
 
 client = None
@@ -278,10 +279,11 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         "\u4e66\u540d": bookName,
         "BookId": bookId,
         "ISBN": isbn,
-        "\u94fe\u63a5": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
+        "\u94fe\u63a5": "https://weread.qq.com/web/reader/" + calculate_book_str_id(bookId),
         "\u4f5c\u8005": author,
         "Sort": sort,
         "\u8bc4\u5206": rating,
+        "\u5c01\u9762": cover,
     }
     if categories != None:
         raw_properties["\u5206\u7c7b"] = categories
@@ -290,27 +292,28 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime", 0)
         readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}\u65f6"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}\u5206"
-        raw_properties["\u72b6\u6001"] = "\u8bfb\u5b8c" if markedStatus == 4 else "\u5728\u8bfb"
-        raw_properties["\u9605\u8bfb\u65f6\u957f"] = format_time
+        # Store reading time as seconds (number)
+        raw_properties["\u9605\u8bfb\u65f6\u957f"] = readingTime
         raw_properties["\u9605\u8bfb\u8fdb\u5ea6"] = readingProgress
-        if "finishedDate" in read_info:
-            raw_properties["\u65f6\u95f4"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        # Map status to match original template naming
+        if markedStatus == 4:
+            raw_properties["\u72b6\u6001"] = "\u8bfb\u5b8c"
+        elif markedStatus == 2:
+            raw_properties["\u72b6\u6001"] = "\u5728\u8bfb"
+        else:
+            raw_properties["\u72b6\u6001"] = "\u672a\u8bfb"
+        # Store finish date
+        finish_time = read_info.get("finishedDate")
+        if finish_time:
+            raw_properties["\u65e5\u671f"] = datetime.utcfromtimestamp(finish_time).strftime("%Y-%m-%d")
 
     properties = build_book_properties(raw_properties)
-    icon = get_icon(cover)
+    icon = {"type": "external", "external": {"url": cover}}
+    page_cover = {"type": "external", "external": {"url": cover}}
     # notion api \u9650\u5236100\u4e2ablock
-    response = client.pages.create(parent=parent, icon=icon, cover=icon, properties=properties)
+    response = client.pages.create(
+        parent=parent, icon=icon, cover=page_cover, properties=properties
+    )
     id = response["id"]
     return id
 
@@ -603,6 +606,8 @@ def ensure_library_setup():
         parent_page_id = match.group(0)
     else:
         fail_config("NOTION_PAGE \u683c\u5f0f\u4e0d\u6b63\u786e")
+    # Rename parent page to "个人图书馆"
+    rename_page(parent_page_id, "\u4e2a\u4eba\u56fe\u4e66\u9986")
     books_db_id = ensure_library(parent_page_id)
     print("Books DB: " + books_db_id)
 
