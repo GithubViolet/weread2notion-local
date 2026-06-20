@@ -370,17 +370,22 @@ def _build_callout(item):
     return callout
 
 
-def _build_chapter_table(all_chapters, bookmark_list):
+def _build_chapter_table(all_chapters, bookmark_list, page_ids=None):
     """Build a Notion table block showing ALL chapters with note/highlight counts.
 
     *all_chapters* is a sorted list of chapter info dicts (by chapterIdx).
     *bookmark_list* is the pre-merge list of bookmarks (no _callout_icon)
     and reviews (_callout_icon = NOTE_CALLOUT_ICON).
+    *page_ids* is an optional ``{chapterUid: page_id}`` mapping; when
+    provided the title cell becomes a clickable page mention link.
 
     Returns a table block dict, or None if there are no chapters.
     """
     if not all_chapters:
         return None
+
+    if page_ids is None:
+        page_ids = {}
 
     # Count notes and bookmarks per chapterUid
     note_counts = {}
@@ -429,17 +434,30 @@ def _build_chapter_table(all_chapters, bookmark_list):
         # Indent sub-chapters for visual hierarchy
         prefix = "  " * (level - 1)
 
-        # Count notes and marks for this chapter
-        n_notes = note_counts.get(uid, 0)
-        n_marks = mark_counts.get(uid, 0)
-
         # Display counts — use number if > 0, dash otherwise
         notes_text = str(n_notes) if n_notes > 0 else "-"
         marks_text = str(n_marks) if n_marks > 0 else "-"
 
+        # Title cell — embed a clickable page mention link if available
+        page_id = page_ids.get(uid)
+        if page_id:
+            title_cell = [
+                {
+                    "type": "mention",
+                    "mention": {
+                        "type": "page",
+                        "page": {"id": page_id},
+                    },
+                }
+            ]
+        else:
+            title_cell = [
+                {"type": "text", "text": {"content": title}}
+            ]
+
         row_cells = [
             [{"type": "text", "text": {"content": prefix + str(len(data_rows) + 1)}}],
-            [{"type": "text", "text": {"content": title}}],
+            title_cell,
             [{"type": "text", "text": {"content": notes_text}}],
             [{"type": "text", "text": {"content": marks_text}}],
         ]
@@ -464,16 +482,19 @@ def _build_chapter_table(all_chapters, bookmark_list):
     }
 
 
-def get_children(chapter, summary, bookmark_list):
+def get_children(chapter, summary, bookmark_list, child_page_ids=None):
     """Build the top-level blocks for a book page.
 
-    Returns ``(children, child_pages_data)`` where *children* is a list of
-    Notion block dicts to append directly, and *child_pages_data* is a list
-    of ``{"title": ..., "blocks": [...]}`` dicts — one per chapter that has
-    notes — used by :func:`create_chapter_child_pages`.
+    Returns a list of Notion block dicts (chapter overview table and
+    optional reviews heading) to be appended to the book page.
+
+    *child_page_ids* is an optional ``{chapterUid: page_id}`` mapping
+    used to embed clickable page-mention links in the table's title
+    column.
     """
+    if child_page_ids is None:
+        child_page_ids = {}
     children = []
-    child_pages_data = []
 
     # ── Chapter overview table ──────────────────────────────────────────
     all_chapters = []
@@ -484,7 +505,7 @@ def get_children(chapter, summary, bookmark_list):
             all_chapters.append(item)
         all_chapters.sort(key=lambda x: x.get("chapterIdx", 0))
 
-    chapter_table = _build_chapter_table(all_chapters, bookmark_list)
+    chapter_table = _build_chapter_table(all_chapters, bookmark_list, child_page_ids)
     if chapter_table:
         children.append(chapter_table)
 
@@ -507,7 +528,18 @@ def get_children(chapter, summary, bookmark_list):
             review_heading[review_heading["type"]]["children"] = review_children
         children.append(review_heading)
 
-    # ── Group bookmarks by chapterUid for child pages ───────────────────
+    return children
+
+
+def build_child_pages_data(chapter, bookmark_list):
+    """Group bookmarks by chapter and build child page descriptors.
+
+    Returns a list of ``{"title", "blocks", "uid"}`` dicts — one per
+    chapter that has notes.  Call :func:`create_chapter_child_pages`
+    afterwards to actually create the pages in Notion.
+    """
+    child_pages_data = []
+
     bookmarks_by_chapter = {}
     for data in bookmark_list:
         uid = data.get("chapterUid", 1)
@@ -518,14 +550,12 @@ def get_children(chapter, summary, bookmark_list):
         if chapter:
             info = chapter.get(uid) or chapter.get(str(uid))
         ch_title = info.get("title", "") if info else ""
-        ch_level = info.get("level", 1) if info else 1
 
-        # Build readable page title
+        # Clean page title (note count is already shown in the table)
         if ch_title:
-            page_title = "第{}章 {}".format(uid, ch_title)
+            page_title = "\u7b2c{}\u7ae0 {}".format(uid, ch_title)
         else:
-            page_title = "章节 {}".format(uid)
-        page_title += " ({}条笔记)".format(len(bookmarks))
+            page_title = "\u7ae0\u8282 {}".format(uid)
 
         # Build callout blocks for inside the child page
         blocks = []
@@ -545,25 +575,23 @@ def get_children(chapter, summary, bookmark_list):
             child_pages_data.append({
                 "title": page_title,
                 "blocks": blocks,
-                "level": ch_level,
+                "uid": uid,
             })
 
-    return children, child_pages_data
+    return child_pages_data
 
 
 def create_chapter_child_pages(book_page_id, child_pages_data):
     """Create a Notion child page for each chapter that has notes.
 
-    Child pages appear as clickable links in the book page's sidebar / body,
-    and contain all the callout blocks for that chapter's notes.
+    Returns a ``{chapterUid: page_id}`` mapping so that the caller can
+    embed clickable page-mention links in the chapter overview table.
     """
-    created = 0
+    page_ids = {}
     for cp in child_pages_data:
         time.sleep(0.5)  # respect rate limits
         try:
-            # Notion requires non-empty children; always satisfied here
-            # because we only include chapters with blocks.
-            client.pages.create(
+            response = client.pages.create(
                 parent={"page_id": book_page_id},
                 properties={
                     "title": {
@@ -572,11 +600,12 @@ def create_chapter_child_pages(book_page_id, child_pages_data):
                 },
                 children=cp["blocks"],
             )
-            created += 1
+            page_ids[cp["uid"]] = response["id"]
         except Exception as e:
             print("  Failed to create chapter page '{}': {}".format(cp["title"], e))
-    if created:
-        print("  Created {} chapter pages".format(created))
+    if page_ids:
+        print("  Created {} chapter pages".format(len(page_ids)))
+    return page_ids
 
 
 def transform_id(book_id):
@@ -732,9 +761,12 @@ def sync():
                 bookmark_list,
                 key=lambda x: get_note_sort_key(x, chapter),
             )
-            children, child_pages_data = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
-            create_chapter_child_pages(id, child_pages_data)
+            # 1. Build child page data and create pages first
+            child_pages_data = build_child_pages_data(chapter, bookmark_list)
+            child_page_ids = create_chapter_child_pages(id, child_pages_data)
+            # 2. Build table (with page links) + reviews, then append
+            children = get_children(chapter, summary, bookmark_list, child_page_ids)
+            add_children(id, children)
 
 
 def main(argv=None):
