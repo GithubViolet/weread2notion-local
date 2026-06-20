@@ -309,11 +309,12 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
 
     properties = build_book_properties(raw_properties)
     icon = {"type": "external", "external": {"url": cover}}
-    # No page cover (banner) — keep the page clean.
-    # The book cover shows as the page icon (avatar) only.
-    # In gallery view, set card preview to "Page icon" to see covers.
+    page_cover = {"type": "external", "external": {"url": cover}}
+    # Page cover is needed for Gallery view card preview (set to "Page cover").
+    # If you don't want the banner inside the page, use "Hide page cover"
+    # from the page's ... menu in Notion.
     response = client.pages.create(
-        parent=parent, icon=icon, properties=properties
+        parent=parent, icon=icon, cover=page_cover, properties=properties
     )
     id = response["id"]
     return id
