@@ -20,7 +20,6 @@ from .blocks import (
     get_rich_text,
     get_select,
     get_status,
-    get_table_of_contents,
     get_title,
     get_url,
 )
@@ -466,7 +465,17 @@ def _build_chapter_table(all_chapters, bookmark_list):
 
 
 def get_children(chapter, summary, bookmark_list):
+    """Build the top-level blocks for a book page.
+
+    Returns ``(children, child_pages_data)`` where *children* is a list of
+    Notion block dicts to append directly, and *child_pages_data* is a list
+    of ``{"title": ..., "blocks": [...]}`` dicts — one per chapter that has
+    notes — used by :func:`create_chapter_child_pages`.
+    """
     children = []
+    child_pages_data = []
+
+    # ── Chapter overview table ──────────────────────────────────────────
     all_chapters = []
     if chapter:
         for uid, info in chapter.items():
@@ -474,131 +483,13 @@ def get_children(chapter, summary, bookmark_list):
             item["chapterUid"] = item.get("chapterUid", uid)
             all_chapters.append(item)
         all_chapters.sort(key=lambda x: x.get("chapterIdx", 0))
-    chapter_nodes = {node.get("chapterUid"): node for node in all_chapters}
-    # Add table of contents at the top
-    children.append(get_table_of_contents())
 
-    # Build chapter overview table (BEFORE bookmark_list is modified)
     chapter_table = _build_chapter_table(all_chapters, bookmark_list)
     if chapter_table:
         children.append(chapter_table)
 
-    def get_ancestor_chain(current_chapter_info):
-        if not current_chapter_info:
-            return []
-        try:
-            current_pos = all_chapters.index(current_chapter_info)
-        except ValueError:
-            return [current_chapter_info]
-
-        chain = []
-        target_level = current_chapter_info.get("level", 1)
-        for index in range(current_pos - 1, -1, -1):
-            candidate = all_chapters[index]
-            if candidate.get("level", 1) < target_level:
-                chain.insert(0, candidate)
-                target_level = candidate.get("level", 1)
-                if target_level <= 1:
-                    break
-        chain.append(current_chapter_info)
-        return chain
-
-    if chapter:
-        grouped_bookmarks = []
-        last_uid = None
-        current_group = None
-
-        for data in bookmark_list:
-            uid = data.get("chapterUid", 1)
-            if uid != last_uid:
-                if current_group:
-                    grouped_bookmarks.append(current_group)
-                info = chapter.get(uid) or chapter.get(str(uid))
-                current_group = {
-                    "chapterUid": uid,
-                    "bookmarks": [],
-                    "chapterInfo": info,
-                }
-                last_uid = uid
-            current_group["bookmarks"].append(data)
-        if current_group:
-            grouped_bookmarks.append(current_group)
-
-        previous_path_uids = []
-        for group in grouped_bookmarks:
-            info = group["chapterInfo"]
-            if info:
-                current_info = chapter_nodes.get(group["chapterUid"]) or chapter_nodes.get(
-                    str(group["chapterUid"])
-                )
-                if current_info is None:
-                    current_info = dict(info)
-                    current_info["chapterUid"] = current_info.get("chapterUid", group["chapterUid"])
-                path = get_ancestor_chain(current_info)
-
-                divergence_index = 0
-                min_len = min(len(path), len(previous_path_uids))
-                while divergence_index < min_len:
-                    path_uid = path[divergence_index].get("chapterUid")
-                    if path_uid != previous_path_uids[divergence_index]:
-                        break
-                    divergence_index += 1
-
-                # Ancestor headings (non-toggleable)
-                for chapter_node in path[divergence_index:-1]:
-                    children.append(
-                        get_heading(
-                            chapter_node.get("level"), chapter_node.get("title"),
-                            toggleable=False,
-                        )
-                    )
-
-                # Current chapter heading (toggleable) with nested callouts
-                leaf = path[-1]
-                heading_block = get_heading(
-                    leaf.get("level"), leaf.get("title"),
-                    toggleable=True,
-                )
-                heading_children = []
-                for bm in group["bookmarks"]:
-                    markText = bm.get("markText") or ""
-                    if not markText:
-                        continue
-                    if len(markText) > 2000:
-                        # Split long text into multiple callouts
-                        for j in range(0, len(markText) // 2000 + 1):
-                            chunk = markText[j * 2000 : (j + 1) * 2000]
-                            icon = bm.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
-                            heading_children.append(get_callout(chunk, icon=icon))
-                    else:
-                        heading_children.append(_build_callout(bm))
-
-                if heading_children:
-                    heading_block[heading_block["type"]]["children"] = heading_children
-                children.append(heading_block)
-                previous_path_uids = [node.get("chapterUid") for node in path]
-            else:
-                previous_path_uids = []
-                # No chapter info — add callouts directly
-                for bm in group["bookmarks"]:
-                    markText = bm.get("markText") or ""
-                    if not markText:
-                        continue
-                    heading_children = []
-                    heading_children.append(_build_callout(bm))
-                    for c in heading_children:
-                        children.append(c)
-
-    else:
-        # No chapter information — add callouts at top level
-        for data in bookmark_list:
-            markText = data.get("markText") or ""
-            if not markText:
-                continue
-            children.append(_build_callout(data))
-
-    # Reviews / 点评 section
-    if summary != None and len(summary) > 0:
+    # ── Reviews / 点评 (toggleable heading) ─────────────────────────────
+    if summary is not None and len(summary) > 0:
         review_heading = get_heading(1, "\u70b9\u8bc4", toggleable=True)
         review_children = []
         for i in summary:
@@ -616,7 +507,76 @@ def get_children(chapter, summary, bookmark_list):
             review_heading[review_heading["type"]]["children"] = review_children
         children.append(review_heading)
 
-    return children, {}
+    # ── Group bookmarks by chapterUid for child pages ───────────────────
+    bookmarks_by_chapter = {}
+    for data in bookmark_list:
+        uid = data.get("chapterUid", 1)
+        bookmarks_by_chapter.setdefault(uid, []).append(data)
+
+    for uid, bookmarks in bookmarks_by_chapter.items():
+        info = None
+        if chapter:
+            info = chapter.get(uid) or chapter.get(str(uid))
+        ch_title = info.get("title", "") if info else ""
+        ch_level = info.get("level", 1) if info else 1
+
+        # Build readable page title
+        if ch_title:
+            page_title = "第{}章 {}".format(uid, ch_title)
+        else:
+            page_title = "章节 {}".format(uid)
+        page_title += " ({}条笔记)".format(len(bookmarks))
+
+        # Build callout blocks for inside the child page
+        blocks = []
+        for bm in bookmarks:
+            markText = bm.get("markText") or ""
+            if not markText:
+                continue
+            if len(markText) > 2000:
+                for j in range(0, len(markText) // 2000 + 1):
+                    chunk = markText[j * 2000 : (j + 1) * 2000]
+                    icon = bm.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
+                    blocks.append(get_callout(chunk, icon=icon))
+            else:
+                blocks.append(_build_callout(bm))
+
+        if blocks:
+            child_pages_data.append({
+                "title": page_title,
+                "blocks": blocks,
+                "level": ch_level,
+            })
+
+    return children, child_pages_data
+
+
+def create_chapter_child_pages(book_page_id, child_pages_data):
+    """Create a Notion child page for each chapter that has notes.
+
+    Child pages appear as clickable links in the book page's sidebar / body,
+    and contain all the callout blocks for that chapter's notes.
+    """
+    created = 0
+    for cp in child_pages_data:
+        time.sleep(0.5)  # respect rate limits
+        try:
+            # Notion requires non-empty children; always satisfied here
+            # because we only include chapters with blocks.
+            client.pages.create(
+                parent={"page_id": book_page_id},
+                properties={
+                    "title": {
+                        "title": [{"type": "text", "text": {"content": cp["title"]}}]
+                    }
+                },
+                children=cp["blocks"],
+            )
+            created += 1
+        except Exception as e:
+            print("  Failed to create chapter page '{}': {}".format(cp["title"], e))
+    if created:
+        print("  Created {} chapter pages".format(created))
 
 
 def transform_id(book_id):
@@ -772,10 +732,9 @@ def sync():
                 bookmark_list,
                 key=lambda x: get_note_sort_key(x, chapter),
             )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
+            children, child_pages_data = get_children(chapter, summary, bookmark_list)
             results = add_children(id, children)
-            if len(grandchild) > 0 and results != None:
-                add_grandchild(grandchild, results)
+            create_chapter_child_pages(id, child_pages_data)
 
 
 def main(argv=None):
