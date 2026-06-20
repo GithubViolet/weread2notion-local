@@ -31,11 +31,13 @@ from .dashboard import (
     query_books_db,
     rename_page,
     set_page_open_full_page,
+    update_reading_stats,
 )
 
 client = None
 books_db_id = None
 weread = None
+_parent_page_id = None
 
 load_dotenv()
 WEREAD_URL = "https://weread.qq.com/"
@@ -196,7 +198,7 @@ def get_read_info(bookId):
         marked_status = 1
     return {
         "markedStatus": marked_status,
-        "readingTime": book.get("recordReadingTime") or 0,
+        "readingTime": (book.get("readingTime") or book.get("recordReadingTime") or 0) * 60,
         "readingProgress": reading_progress,
         "finishedDate": finish_time,
     }
@@ -621,7 +623,7 @@ def normalize_date_value(value):
 
 
 def ensure_library_setup():
-    global books_db_id
+    global books_db_id, _parent_page_id
     parent_page = os.getenv("NOTION_PAGE", "")
     if not parent_page:
         fail_config("\u7f3a\u5c11 NOTION_PAGE\uff0c\u8bf7\u5728 .env \u4e2d\u914d\u7f6e")
@@ -631,6 +633,7 @@ def ensure_library_setup():
         parent_page_id = match.group(0)
     else:
         fail_config("NOTION_PAGE \u683c\u5f0f\u4e0d\u6b63\u786e")
+    _parent_page_id = parent_page_id
     # Rename parent page to "个人图书馆"
     rename_page(parent_page_id, "\u4e2a\u4eba\u56fe\u4e66\u9986")
     books_db_id = ensure_library(parent_page_id)
@@ -701,6 +704,10 @@ def sync():
             child_page_ids = create_chapter_child_pages(id, child_pages_data)
             children = get_children(chapter, summary, bookmark_list, child_page_ids)
             add_children(id, children)
+
+    # Update reading statistics page
+    if books_db_id and _parent_page_id:
+        update_reading_stats(_parent_page_id, books_db_id)
 
 
 def main(argv=None):

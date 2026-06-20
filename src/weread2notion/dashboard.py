@@ -650,6 +650,283 @@ def sync_notes_to_db(notes_db_id, all_notes):
     return total_success, total_failed
 
 
+# ── Reading Statistics Page (阅读统计) ────────────────────────────────────
+
+
+def _extract_prop(page, name, prop_type="text"):
+    """Extract a simple value from a Notion page property."""
+    prop = (page.get("properties") or {}).get(name)
+    if not prop:
+        return None
+    ptype = prop.get("type", "")
+    if ptype == "title":
+        parts = prop.get("title", [])
+        return "".join(p.get("plain_text", "") for p in parts) if parts else ""
+    elif ptype == "rich_text":
+        parts = prop.get("rich_text", [])
+        return "".join(p.get("plain_text", "") for p in parts) if parts else ""
+    elif ptype == "number":
+        return prop.get("number")
+    elif ptype == "status":
+        s = prop.get("status") or {}
+        return s.get("name", "")
+    elif ptype == "date":
+        d = prop.get("date") or {}
+        return d.get("start", "")
+    elif ptype == "multi_select":
+        return [o["name"] for o in prop.get("multi_select", []) if o.get("name")]
+    return None
+
+
+def _format_hours(seconds):
+    """Convert seconds to a readable hours string."""
+    if not seconds:
+        return "0"
+    hours = int(seconds) / 3600
+    if hours >= 100:
+        return str(int(hours))
+    return "{:.1f}".format(hours)
+
+
+def _find_or_create_stats_page(parent_page_id):
+    """Find an existing stats page or create one under *parent_page_id*.
+
+    Returns the page ID.
+    """
+    # Search among existing children
+    try:
+        children = _api("GET", "/blocks/" + parent_page_id + "/children",
+                        params={"page_size": 100})
+        for block in children.get("results", []):
+            if block.get("type") == "child_page":
+                cp = block.get("child_page", {})
+                if cp.get("title") == "阅读统计":
+                    return block["id"]
+    except Exception:
+        pass
+
+    # Create new
+    body = {
+        "parent": {"page_id": parent_page_id},
+        "icon": {"type": "emoji", "emoji": "\U0001f4ca"},
+        "properties": {
+            "title": {
+                "title": [{"type": "text", "text": {"content": "阅读统计"}}]
+            }
+        },
+    }
+    result = _api("POST", "/pages", body)
+    page_id = result["id"]
+    print("[Stats] Created page: " + page_id)
+    return page_id
+
+
+def update_reading_stats(parent_page_id, books_db_id):
+    """Create or update the reading statistics page.
+
+    Queries the books database and builds a visual summary page with
+    overview stats and a recently finished books table.
+    """
+    if not books_db_id:
+        print("[Stats] No books database, skipping")
+        return None
+
+    # Query all books
+    result = query_books_db(books_db_id)
+    books = result.get("results", [])
+
+    if not books:
+        print("[Stats] No books found, skipping")
+        return None
+
+    # ── Gather statistics ─────────────────────────────────────────────
+    total = len(books)
+    reading_time_total = 0
+    finished_books = []
+    reading_books = []
+    unread_books = []
+    ratings = []
+
+    for page in books:
+        status = _extract_prop(page, "状态", "status") or ""
+        rtime = _extract_prop(page, "阅读时长", "number") or 0
+        rating = _extract_prop(page, "评分", "number")
+        title = _extract_prop(page, "书名", "title") or ""
+        author = _extract_prop(page, "作者", "rich_text") or ""
+        finish_date = _extract_prop(page, "日期", "date") or ""
+
+        reading_time_total += rtime
+        if status == "读完":
+            finished_books.append({
+                "title": title, "author": author,
+                "rating": rating, "date": finish_date,
+            })
+            if rating:
+                ratings.append(rating)
+        elif status == "在读":
+            reading_books.append(title)
+        elif status == "未读":
+            unread_books.append(title)
+
+    # ── Find / create the stats page ──────────────────────────────────
+    stats_page_id = _find_or_create_stats_page(parent_page_id)
+
+    # Clear old content
+    try:
+        old = _api("GET", "/blocks/" + stats_page_id + "/children",
+                   params={"page_size": 100})
+        for block in old.get("results", []):
+            try:
+                _api("DELETE", "/blocks/" + block["id"])
+                time.sleep(0.1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ── Build blocks ──────────────────────────────────────────────────
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    blocks = []
+
+    # Overview callout
+    avg_rating = "{:.1f}".format(sum(ratings) / len(ratings)) if ratings else "-"
+    hours = _format_hours(reading_time_total)
+
+    overview_lines = (
+        "\U0001f4da 共 {} 本书  |  "
+        "\u23f1\ufe0f 总阅读 {} 小时  |  "
+        "\u2b50 平均评分 {}"
+    ).format(total, hours, avg_rating)
+
+    blocks.append({
+        "type": "callout",
+        "callout": {
+            "rich_text": [{"type": "text", "text": {"content": overview_lines}}],
+            "icon": {"type": "emoji", "emoji": "\U0001f4ca"},
+        },
+    })
+
+    # Status breakdown callout
+    status_lines = (
+        "\u2705 读完 {} 本  |  "
+        "\U0001f4d6 在读 {} 本  |  "
+        "\U0001f4d5 未读 {} 本"
+    ).format(len(finished_books), len(reading_books), len(unread_books))
+
+    blocks.append({
+        "type": "callout",
+        "callout": {
+            "rich_text": [{"type": "text", "text": {"content": status_lines}}],
+            "icon": {"type": "emoji", "emoji": "\U0001f4d6"},
+        },
+    })
+
+    # Recently finished books table (top 30)
+    finished_books.sort(key=lambda x: x["date"], reverse=True)
+    display_books = finished_books[:30]
+
+    if display_books:
+        blocks.append({
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": "\u6700\u8fd1\u8bfb\u5b8c"}}],
+                "color": "default",
+            },
+        })
+
+        rows = [
+            {
+                "type": "table_row",
+                "table_row": {
+                    "cells": [
+                        [{"type": "text", "text": {"content": "\u4e66\u540d"}}],
+                        [{"type": "text", "text": {"content": "\u4f5c\u8005"}}],
+                        [{"type": "text", "text": {"content": "\u8bc4\u5206"}}],
+                        [{"type": "text", "text": {"content": "\u8bfb\u5b8c\u65e5\u671f"}}],
+                    ]
+                },
+            }
+        ]
+        for b in display_books:
+            r_text = "{:.1f}".format(b["rating"]) if b["rating"] else "-"
+            d_text = b["date"][:10] if b["date"] else "-"
+            rows.append({
+                "type": "table_row",
+                "table_row": {
+                    "cells": [
+                        [{"type": "text", "text": {"content": b["title"]}}],
+                        [{"type": "text", "text": {"content": b["author"]}}],
+                        [{"type": "text", "text": {"content": r_text}}],
+                        [{"type": "text", "text": {"content": d_text}}],
+                    ]
+                },
+            })
+
+        blocks.append({
+            "type": "table",
+            "table": {
+                "table_width": 4,
+                "has_column_header": True,
+                "has_row_header": False,
+                "children": rows,
+            },
+        })
+
+        if len(finished_books) > 30:
+            blocks.append({
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": {"content": "\u4ec5\u5c55\u793a\u6700\u8fd1 30 \u672c\uff0c\u5171 {} \u672c\u5df2\u8bfb\u5b8c".format(
+                            len(finished_books))},
+                    }],
+                },
+            })
+
+    # Currently reading list
+    if reading_books:
+        blocks.append({
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": "\u6b63\u5728\u9605\u8bfb"}}],
+                "color": "default",
+            },
+        })
+        for title in reading_books[:20]:
+            blocks.append({
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": [{"type": "text", "text": {"content": title}}],
+                },
+            })
+
+    # Update timestamp
+    blocks.append({
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [{
+                "type": "text",
+                "text": {"content": "\u66f4\u65b0\u4e8e " + now},
+                "annotations": {"italic": True, "color": "gray"},
+            }],
+        },
+    })
+
+    # ── Add blocks in batches of 100 ──────────────────────────────────
+    for i in range(0, len(blocks), 100):
+        batch = blocks[i:i + 100]
+        try:
+            _api("PATCH", "/blocks/" + stats_page_id + "/children",
+                 {"children": batch})
+            time.sleep(RATE_LIMIT_DELAY)
+        except Exception as exc:
+            print("[Stats] Failed to add blocks: " + str(exc))
+
+    print("[Stats] Updated reading stats page")
+    return stats_page_id
+
+
 # ── Dashboard Entry Point (backward-compatible) ──────────────────────────
 
 
