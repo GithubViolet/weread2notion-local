@@ -371,6 +371,100 @@ def _build_callout(item):
     return callout
 
 
+def _build_chapter_table(all_chapters, bookmark_list):
+    """Build a Notion table block showing ALL chapters with note/highlight counts.
+
+    *all_chapters* is a sorted list of chapter info dicts (by chapterIdx).
+    *bookmark_list* is the pre-merge list of bookmarks (no _callout_icon)
+    and reviews (_callout_icon = NOTE_CALLOUT_ICON).
+
+    Returns a table block dict, or None if there are no chapters.
+    """
+    if not all_chapters:
+        return None
+
+    # Count notes and bookmarks per chapterUid
+    note_counts = {}
+    mark_counts = {}
+    for item in bookmark_list:
+        uid = item.get("chapterUid", 1)
+        if item.get("_callout_icon"):
+            # Review / personal note
+            note_counts[uid] = note_counts.get(uid, 0) + 1
+        else:
+            # Underline / bookmark
+            mark_counts[uid] = mark_counts.get(uid, 0) + 1
+
+    # Build header row
+    header_cells = [
+        [{"type": "text", "text": {"content": "\u7ae0\u8282"}}],   # 章节
+        [{"type": "text", "text": {"content": "\u6807\u9898"}}],   # 标题
+        [{"type": "text", "text": {"content": "\u7b14\u8bb0"}}],   # 笔记
+        [{"type": "text", "text": {"content": "\u5212\u7ebf"}}],   # 划线
+    ]
+    header_row = {
+        "type": "table_row",
+        "table_row": {"cells": header_cells},
+    }
+
+    # Build data rows — one per chapter
+    data_rows = []
+    for ch in all_chapters:
+        uid = ch.get("chapterUid")
+        level = ch.get("level", 1)
+        title = ch.get("title", "")
+        idx = ch.get("chapterIdx", 0)
+
+        # Count notes and marks for this chapter
+        n_notes = note_counts.get(uid, 0)
+        n_marks = mark_counts.get(uid, 0)
+
+        # Skip metadata chapters: level 0, or known boilerplate titles
+        # with no notes/highlights
+        skip_titles = {"\u7248\u6743\u4fe1\u606f", "\u6587\u524d", "\u63d2\u56fe"}
+        if level == 0:
+            continue
+        if title in skip_titles and n_notes == 0 and n_marks == 0:
+            continue
+
+        # Indent sub-chapters for visual hierarchy
+        prefix = "  " * (level - 1)
+
+        # Count notes and marks for this chapter
+        n_notes = note_counts.get(uid, 0)
+        n_marks = mark_counts.get(uid, 0)
+
+        # Display counts — use number if > 0, dash otherwise
+        notes_text = str(n_notes) if n_notes > 0 else "-"
+        marks_text = str(n_marks) if n_marks > 0 else "-"
+
+        row_cells = [
+            [{"type": "text", "text": {"content": prefix + str(len(data_rows) + 1)}}],
+            [{"type": "text", "text": {"content": title}}],
+            [{"type": "text", "text": {"content": notes_text}}],
+            [{"type": "text", "text": {"content": marks_text}}],
+        ]
+        data_rows.append({
+            "type": "table_row",
+            "table_row": {"cells": row_cells},
+        })
+
+    all_rows = [header_row] + data_rows
+    if len(all_rows) < 2:
+        # Only header, no data — skip table
+        return None
+
+    return {
+        "type": "table",
+        "table": {
+            "table_width": 4,
+            "has_column_header": True,
+            "has_row_header": False,
+            "children": all_rows,
+        },
+    }
+
+
 def get_children(chapter, summary, bookmark_list):
     children = []
     all_chapters = []
@@ -383,6 +477,11 @@ def get_children(chapter, summary, bookmark_list):
     chapter_nodes = {node.get("chapterUid"): node for node in all_chapters}
     # Add table of contents at the top
     children.append(get_table_of_contents())
+
+    # Build chapter overview table (BEFORE bookmark_list is modified)
+    chapter_table = _build_chapter_table(all_chapters, bookmark_list)
+    if chapter_table:
+        children.append(chapter_table)
 
     def get_ancestor_chain(current_chapter_info):
         if not current_chapter_info:
