@@ -8,7 +8,6 @@ import requests
 from datetime import datetime
 import hashlib
 from dotenv import load_dotenv
-from notion_client.errors import APIResponseError
 from retrying import retry
 from .blocks import (
     get_callout,
@@ -24,12 +23,21 @@ from .blocks import (
     get_title,
     get_url,
 )
+from .dashboard import (
+    BOOKMARK_TYPE,
+    NOTE_TYPE,
+    REVIEW_TYPE,
+    ensure_library,
+    get_property_schema,
+    build_book_properties,
+    delete_old_book_pages,
+    query_books_db,
+    sync_notes_to_db,
+)
 
 client = None
-data_source_id = None
-data_source_property_types = {}
-title_property_name = None
-skipped_property_names = set()
+books_db_id = None
+notes_db_id = None
 weread = None
 
 load_dotenv()
@@ -37,8 +45,8 @@ WEREAD_URL = "https://weread.qq.com/"
 WEREAD_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
 WEREAD_SKILL_VERSION = "1.0.3"
 NOTION_VERSION = "2026-03-11"
-BOOKMARK_CALLOUT_ICON = "〰️"
-NOTE_CALLOUT_ICON = "✍️"
+BOOKMARK_CALLOUT_ICON = "\u3030\ufe0f"
+NOTE_CALLOUT_ICON = "\u270d\ufe0f"
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -60,7 +68,7 @@ def emit_error(message):
         safe = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print(f"::error::{safe}")
     else:
-        print(f"配置错误: {message}")
+        print(f"\u914d\u7f6e\u9519\u8bef: {message}")
 
 
 def fail_config(message):
@@ -72,21 +80,21 @@ def clean_secret_value(name, required=False):
     raw = os.getenv(name)
     if raw is None:
         if required:
-            fail_config(f"缺少 {name}，请在 GitHub Actions Secrets 中配置")
+            fail_config(f"\u7f3a\u5c11 {name}\uff0c\u8bf7\u5728 GitHub Actions Secrets \u4e2d\u914d\u7f6e")
         return None
     value = re.sub(r"\s+", "", raw)
     if value:
         os.environ[name] = value
         return value
     if required:
-        fail_config(f"{name} 为空，请检查 GitHub Actions Secrets")
+        fail_config(f"{name} \u4e3a\u7a7a\uff0c\u8bf7\u68c0\u67e5 GitHub Actions Secrets")
     os.environ.pop(name, None)
     return None
 
 
 def validate_regex(name, value, pattern, hint):
     if value and not pattern.search(value):
-        fail_config(f"{name} 格式不正确：{hint}")
+        fail_config(f"{name} \u683c\u5f0f\u4e0d\u6b63\u786e\uff1a{hint}")
     return value
 
 
@@ -94,38 +102,23 @@ def validate_secret_inputs():
     weread_api_key = clean_secret_value("WEREAD_API_KEY", required=True)
     notion_token = clean_secret_value("NOTION_TOKEN", required=True)
     notion_page = clean_secret_value("NOTION_PAGE")
-    notion_database_id = clean_secret_value("NOTION_DATABASE_ID")
-    notion_data_source_id = clean_secret_value("NOTION_DATA_SOURCE_ID")
 
     validate_regex(
         "WEREAD_API_KEY",
         weread_api_key,
         WEREAD_API_KEY_PATTERN,
-        "应为微信读书 Gateway API Key，不能包含空格或换行",
+        "\u5e94\u4e3a\u5fae\u4fe1\u8bfb\u4e66 Gateway API Key\uff0c\u4e0d\u80fd\u5305\u542b\u7a7a\u683c\u6216\u6362\u884c",
     )
     validate_regex(
         "NOTION_TOKEN",
         notion_token,
         NOTION_TOKEN_PATTERN,
-        "应以 secret_ 或 ntn_ 开头，不能包含空格或换行",
+        "\u5e94\u4ee5 secret_ \u6216 ntn_ \u5f00\u5934\uff0c\u4e0d\u80fd\u5305\u542b\u7a7a\u683c\u6216\u6362\u884c",
     )
-    for name, value in (
-        ("NOTION_DATA_SOURCE_ID", notion_data_source_id),
-        ("NOTION_DATABASE_ID", notion_database_id),
-    ):
-        validate_regex(
-            name,
-            value,
-            NOTION_ID_PATTERN,
-            "应为 32 位 Notion ID 或带连字符的 UUID",
-        )
     if notion_page and not NOTION_ID_IN_TEXT_PATTERN.search(notion_page):
-        fail_config("NOTION_PAGE 格式不正确：请填写 Notion 页面链接、数据库链接或 ID")
-    if not (notion_data_source_id or notion_page or notion_database_id):
-        fail_config(
-            "缺少 NOTION_PAGE / NOTION_DATA_SOURCE_ID / NOTION_DATABASE_ID，"
-            "请至少配置其中一个"
-        )
+        fail_config("NOTION_PAGE \u683c\u5f0f\u4e0d\u6b63\u786e\uff1a\u8bf7\u586b\u5199 Notion \u9875\u9762\u94fe\u63a5\u6216 ID")
+    if not notion_page:
+        fail_config("\u7f3a\u5c11 NOTION_PAGE\uff0c\u8bf7\u914d\u7f6e")
     return {
         "weread_api_key": weread_api_key,
         "notion_token": notion_token,
@@ -135,7 +128,7 @@ def validate_secret_inputs():
 class WeReadGatewayClient:
     def __init__(self, api_key):
         if not api_key:
-            fail_config("没有找到 WEREAD_API_KEY，请在 GitHub Actions Secrets 中配置")
+            fail_config("\u6ca1\u6709\u627e\u5230 WEREAD_API_KEY\uff0c\u8bf7\u5728 GitHub Actions Secrets \u4e2d\u914d\u7f6e")
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -155,9 +148,9 @@ class WeReadGatewayClient:
         response.raise_for_status()
         data = response.json()
         if data.get("upgrade_info"):
-            raise Exception(f"微信读书 skill 需要升级: {data.get('upgrade_info')}")
+            raise Exception(f"\u5fae\u4fe1\u8bfb\u4e66 skill \u9700\u8981\u5347\u7ea7: {data.get('upgrade_info')}")
         if data.get("errcode", 0) != 0:
-            raise Exception(f"微信读书 Gateway 请求失败: {api_name}, errcode={data.get('errcode')}, response={data}")
+            raise Exception(f"\u5fae\u4fe1\u8bfb\u4e66 Gateway \u8bf7\u6c42\u5931\u8d25: {api_name}, errcode={data.get('errcode')}, response={data}")
         return data
 
 
@@ -184,7 +177,7 @@ def get_note_sort_key(item, chapter=None):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_bookmark_list(bookId):
-    """获取我的划线"""
+    """\u83b7\u53d6\u6211\u7684\u5212\u7ebf"""
     data = weread.request("/book/bookmarklist", bookId=bookId)
     updated = data.get("updated") or []
     return sorted(updated, key=get_note_sort_key)
@@ -230,7 +223,7 @@ def normalize_rating(value):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_bookinfo(bookId):
-    """获取书的详情"""
+    """\u83b7\u53d6\u4e66\u7684\u8be6\u60c5"""
     data = weread.request("/book/info", bookId=bookId)
     isbn = data.get("isbn", "")
     newRating = normalize_rating(data.get("newRating"))
@@ -239,7 +232,7 @@ def get_bookinfo(bookId):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_review_list(bookId):
-    """获取笔记"""
+    """\u83b7\u53d6\u7b14\u8bb0"""
     reviews_data = []
     hasMore = 1
     synckey = 0
@@ -268,45 +261,35 @@ def get_review_list(bookId):
 
 
 def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
-    filter = build_equals_filter("BookId", bookId)
-    response = query_data_source(filter=filter)
-    for result in response["results"]:
-        try:
-            client.blocks.delete(block_id=result["id"])
-        except Exception as e:
-            print(f"删除块时出错: {e}")
+    """\u68c0\u67e5\u662f\u5426\u5df2\u7ecf\u63d2\u5165\u8fc7  \u5982\u679c\u5df2\u7ecf\u63d2\u5165\u4e86\u5c31\u5220\u9664"""
+    delete_old_book_pages(books_db_id, bookId)
 
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_chapter_info(bookId):
-    """获取章节信息"""
+    """\u83b7\u53d6\u7ae0\u8282\u4fe1\u606f"""
     data = weread.request("/book/chapterinfo", bookId=bookId)
     chapters = data.get("chapters") or []
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
 def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
+    """\u63d2\u5165\u5230notion"""
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"type": "data_source_id", "data_source_id": data_source_id}
+    parent = {"database_id": books_db_id}
     raw_properties = {
-        title_property_name: bookName,
+        "\u4e66\u540d": bookName,
         "BookId": bookId,
         "ISBN": isbn,
-        "链接": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
-        "作者": author,
+        "\u94fe\u63a5": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
+        "\u4f5c\u8005": author,
         "Sort": sort,
-        "评分": rating,
+        "\u8bc4\u5206": rating,
     }
     if categories != None:
-        raw_properties["分类"] = categories
-    read_info = (
-        get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
-        else None
-    )
+        raw_properties["\u5206\u7c7b"] = categories
+    read_info = get_read_info(bookId=bookId)
     if read_info != None:
         markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime", 0)
@@ -314,24 +297,24 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         format_time = ""
         hour = readingTime // 3600
         if hour > 0:
-            format_time += f"{hour}时"
+            format_time += f"{hour}\u65f6"
         minutes = readingTime % 3600 // 60
         if minutes > 0:
-            format_time += f"{minutes}分"
-        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
-        raw_properties["阅读时长"] = format_time
-        raw_properties["阅读进度"] = readingProgress
+            format_time += f"{minutes}\u5206"
+        raw_properties["\u72b6\u6001"] = "\u8bfb\u5b8c" if markedStatus == 4 else "\u5728\u8bfb"
+        raw_properties["\u9605\u8bfb\u65f6\u957f"] = format_time
+        raw_properties["\u9605\u8bfb\u8fdb\u5ea6"] = readingProgress
         if "finishedDate" in read_info:
-            raw_properties["时间"] = datetime.utcfromtimestamp(
+            raw_properties["\u65f6\u95f4"] = datetime.utcfromtimestamp(
                 read_info.get("finishedDate")
             ).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
 
-    properties = build_notion_properties(raw_properties)
+    properties = build_book_properties(raw_properties)
     icon = get_icon(cover)
-    # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
+    # notion api \u9650\u5236100\u4e2ablock
+    response = client.pages.create(parent=parent, icon=icon, cover=icon, properties=properties)
     id = response["id"]
     return id
 
@@ -355,7 +338,7 @@ def add_grandchild(grandchild, results):
 
 
 def get_notebooklist():
-    """获取笔记本列表"""
+    """\u83b7\u53d6\u7b14\u8bb0\u672c\u5217\u8868"""
     books = []
     hasMore = 1
     lastSort = None
@@ -373,23 +356,6 @@ def get_notebooklist():
             hasMore = 0
     books.sort(key=lambda x: x.get("sort") or 0)
     return books
-
-
-def get_sort():
-    """获取 data source 中的最新时间"""
-    filter = build_is_not_empty_filter("Sort")
-    sorts = [
-        {
-            "property": "Sort",
-            "direction": "descending",
-        }
-    ]
-    response = query_data_source(filter=filter, sorts=sorts, page_size=1)
-    if len(response.get("results")) == 1:
-        return get_number_property_value(
-            response.get("results")[0].get("properties").get("Sort")
-        )
-    return 0
 
 
 def get_children(chapter, summary, bookmark_list):
@@ -492,7 +458,7 @@ def get_children(chapter, summary, bookmark_list):
                     grandchild[len(children) - 1] = quote
 
     else:
-        # 如果没有章节信息
+        # \u5982\u679c\u6ca1\u6709\u7ae0\u8282\u4fe1\u606f
         for data in bookmark_list:
             markText = data.get("markText") or ""
             if not markText:
@@ -505,7 +471,7 @@ def get_children(chapter, summary, bookmark_list):
                     )
                 )
     if summary != None and len(summary) > 0:
-        children.append(get_heading(1, "点评"))
+        children.append(get_heading(1, "\u70b9\u8bc4"))
         for i in summary:
             content = (i.get("review") or {}).get("content") or ""
             if not content:
@@ -562,102 +528,6 @@ def calculate_book_str_id(book_id):
     return result
 
 
-def extract_notion_id():
-    url_or_id = (
-        os.getenv("NOTION_DATA_SOURCE_ID")
-        or os.getenv("NOTION_PAGE")
-        or os.getenv("NOTION_DATABASE_ID")
-    )
-    if not url_or_id:
-        fail_config("没有找到 NOTION_PAGE / NOTION_DATA_SOURCE_ID，请按照文档填写")
-    match = NOTION_ID_IN_TEXT_PATTERN.search(url_or_id)
-    if match:
-        return match.group(0)
-
-    fail_config("获取 Notion ID 失败，请检查 NOTION_PAGE / NOTION_DATA_SOURCE_ID")
-
-
-def query_data_source(**body):
-    return client.request(
-        path=f"data_sources/{data_source_id}/query",
-        method="POST",
-        body=body,
-    )
-
-
-def load_data_source_schema():
-    """读取当前 data source 的真实属性，只强制要求同步游标需要的字段。"""
-    global data_source_property_types, title_property_name, skipped_property_names
-    response = client.request(path=f"data_sources/{data_source_id}", method="GET")
-    properties = response.get("properties") or {}
-    data_source_property_types = {
-        name: (config or {}).get("type") for name, config in properties.items()
-    }
-    title_property_name = next(
-        (
-            name
-            for name, prop_type in data_source_property_types.items()
-            if prop_type == "title"
-        ),
-        None,
-    )
-    skipped_property_names = set()
-    if not title_property_name:
-        raise Exception("Notion data source 缺少标题属性，请保留一个 Title 类型属性")
-
-    missing = [
-        name for name in ("BookId", "Sort") if name not in data_source_property_types
-    ]
-    if missing:
-        raise Exception(
-            f"Notion data source 缺少必填属性: {', '.join(missing)}。"
-            "请在模板中补充后重试"
-        )
-
-    print(
-        f"已读取 Notion 属性 {len(data_source_property_types)} 个，"
-        f"标题属性: {title_property_name}"
-    )
-
-
-def get_property_type(name):
-    return data_source_property_types.get(name)
-
-
-def has_any_property(names):
-    return any(name in data_source_property_types for name in names)
-
-
-def build_equals_filter(name, value):
-    prop_type = get_property_type(name)
-    if prop_type in {"title", "rich_text", "url", "email", "phone_number"}:
-        return {"property": name, prop_type: {"equals": str(value)}}
-    if prop_type == "number":
-        return {"property": name, "number": {"equals": to_number(value)}}
-    if prop_type == "select":
-        return {"property": name, "select": {"equals": str(value)}}
-    if prop_type == "status":
-        return {"property": name, "status": {"equals": str(value)}}
-    raise Exception(f"Notion 属性 {name} 的类型 {prop_type} 暂不支持用于查询")
-
-
-def build_is_not_empty_filter(name):
-    prop_type = get_property_type(name)
-    if prop_type in {
-        "title",
-        "rich_text",
-        "url",
-        "email",
-        "phone_number",
-        "number",
-        "select",
-        "status",
-        "date",
-    }:
-        return {"property": name, prop_type: {"is_not_empty": True}}
-    raise Exception(f"Notion 属性 {name} 的类型 {prop_type} 暂不支持用于查询")
-
-
 def to_text(value):
     if value is None:
         return ""
@@ -693,98 +563,41 @@ def normalize_date_value(value):
     return value
 
 
-def build_option_property(prop_type, value):
-    names = to_name_list(value)
-    if not names:
-        return None
-    if prop_type == "status":
-        return get_status(names[0])
-    if prop_type == "select":
-        return get_select(names[0])
-    return get_multi_select(names)
+def ensure_library_setup():
+    global books_db_id, notes_db_id
+    parent_page = os.getenv("NOTION_PAGE", "")
+    if not parent_page:
+        fail_config("\u7f3a\u5c11 NOTION_PAGE\uff0c\u8bf7\u5728 .env \u4e2d\u914d\u7f6e")
+    # Extract UUID from URL or ID
+    match = NOTION_ID_IN_TEXT_PATTERN.search(parent_page)
+    if match:
+        parent_page_id = match.group(0)
+    else:
+        fail_config("NOTION_PAGE \u683c\u5f0f\u4e0d\u6b63\u786e")
+    books_db_id, notes_db_id = ensure_library(parent_page_id)
+    print("Books DB: " + books_db_id)
+    print("Notes DB: " + notes_db_id)
 
 
-def build_notion_property(name, value):
-    prop_type = get_property_type(name)
-    if not prop_type:
-        if name not in skipped_property_names:
-            print(f"属性 {name} 在 Notion 模板中不存在，自动跳过")
-            skipped_property_names.add(name)
-        return None
-    if value is None:
-        return None
-
-    if prop_type == "title":
-        return get_title(to_text(value))
-    if prop_type == "rich_text":
-        return get_rich_text(to_text(value))
-    if prop_type == "number":
-        number = to_number(value)
-        return get_number(number) if number is not None else None
-    if prop_type == "url":
-        return get_url(to_text(value))
-    if prop_type in {"multi_select", "status", "select"}:
-        return build_option_property(prop_type, value)
-    if prop_type == "date":
-        return get_date(normalize_date_value(value))
-    if prop_type == "checkbox":
-        return {"checkbox": bool(value)}
-
-    if name not in skipped_property_names:
-        print(f"属性 {name} 的类型 {prop_type} 暂不支持写入，自动跳过")
-        skipped_property_names.add(name)
-    return None
-
-
-def build_notion_properties(raw_properties):
-    return {
-        name: prop
-        for name, value in raw_properties.items()
-        if (prop := build_notion_property(name, value)) is not None
+def get_latest_sort():
+    """Get the latest Sort value from our books database."""
+    filter_body = {
+        "property": "Sort",
+        "number": {"is_not_empty": True}
     }
-
-
-def get_number_property_value(property_value):
-    if not property_value:
-        return 0
-    prop_type = property_value.get("type")
-    value = property_value.get(prop_type)
-    if prop_type == "number":
-        return value or 0
-    if prop_type in {"title", "rich_text"} and value:
-        return to_number(value[0].get("plain_text")) or 0
-    if prop_type in {"select", "status"} and value:
-        return to_number(value.get("name")) or 0
+    sort_body = [{"property": "Sort", "direction": "descending"}]
+    result = query_books_db(books_db_id, filter_body, sort_body, page_size=1)
+    results = result.get("results", [])
+    if results:
+        props = results[0].get("properties", {})
+        sort_prop = props.get("Sort", {})
+        return sort_prop.get("number", 0) or 0
     return 0
 
 
-def resolve_data_source_id(notion_id):
-    if os.getenv("NOTION_DATA_SOURCE_ID"):
-        return notion_id
-
-    try:
-        client.request(path=f"data_sources/{notion_id}", method="GET")
-        return notion_id
-    except APIResponseError as error:
-        code = getattr(error.code, "value", error.code)
-        if code not in {"object_not_found", "validation_error"}:
-            raise
-
-    database = client.request(path=f"databases/{notion_id}", method="GET")
-    sources = database.get("data_sources") or []
-    if not sources:
-        raise Exception(f"数据库 {notion_id} 下没有可用的 data source")
-    if len(sources) > 1:
-        print(
-            f"数据库 {notion_id} 包含 {len(sources)} 个 data sources，默认使用第一个: {sources[0].get('id')}"
-        )
-    return sources[0]["id"]
-
-
 def sync():
-    global client, data_source_id, weread
+    global client, books_db_id, notes_db_id, weread
     secrets = validate_secret_inputs()
-    notion_id = extract_notion_id()
     notion_token = secrets["notion_token"]
     weread = WeReadGatewayClient(secrets["weread_api_key"])
     client = Client(
@@ -792,12 +605,11 @@ def sync():
         log_level=logging.ERROR,
         notion_version=NOTION_VERSION,
     )
-    data_source_id = resolve_data_source_id(notion_id)
     print(f"Notion API Version: {NOTION_VERSION}")
-    print(f"Notion Data Source ID: {data_source_id}")
-    load_data_source_schema()
-    latest_sort = get_sort()
+    ensure_library_setup()
+    latest_sort = get_latest_sort()
     books = get_notebooklist()
+    all_notes = []
     if books != None:
         for index, book in enumerate(books):
             sort = book["sort"]
@@ -813,12 +625,9 @@ def sync():
             categories = book.get("categories")
             if categories != None:
                 categories = [x["title"] for x in categories]
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
+            print(f"\u6b63\u5728\u540c\u6b65 {title} ,\u4e00\u5171{len(books)}\u672c\uff0c\u5f53\u524d\u662f\u7b2c{index+1}\u672c\u3002")
             check(bookId)
-            if has_any_property(("ISBN", "评分")):
-                isbn, rating = get_bookinfo(bookId)
-            else:
-                isbn, rating = "", None
+            isbn, rating = get_bookinfo(bookId)
             id = insert_to_notion(
                 title, bookId, cover, sort, author, isbn, rating, categories
             )
@@ -834,6 +643,72 @@ def sync():
             results = add_children(id, children)
             if len(grandchild) > 0 and results != None:
                 add_grandchild(grandchild, results)
+
+            # \u2500\u2500 Collect notes for the dashboard \u2500\u2500
+            book_weread_url = "https://weread.qq.com/web/reader/" + calculate_book_str_id(bookId)
+            book_reading_progress = None
+            try:
+                read_info = get_read_info(bookId)
+                book_reading_progress = read_info.get("readingProgress")
+            except Exception:
+                pass
+
+            book_categories = categories or []
+
+            # Collect bookmarks (\u5212\u7ebf)
+            for bm in bookmark_list:
+                mark_text = bm.get("markText") or ""
+                if not mark_text:
+                    continue
+                chapter_uid = bm.get("chapterUid", 1)
+                ch_info = None
+                if chapter:
+                    ch_info = chapter.get(chapter_uid) or chapter.get(str(chapter_uid))
+                chapter_title = ch_info.get("title", "") if ch_info else ""
+                is_note = bm.get("_callout_icon") == NOTE_CALLOUT_ICON
+                note_type = NOTE_TYPE if is_note else BOOKMARK_TYPE
+
+                all_notes.append({
+                    "bookId": bookId,
+                    "bookName": title,
+                    "author": author,
+                    "categories": book_categories,
+                    "chapterTitle": chapter_title,
+                    "noteType": note_type,
+                    "markText": mark_text,
+                    "abstract": bm.get("abstract", ""),
+                    "wereadUrl": book_weread_url,
+                    "readingProgress": book_reading_progress,
+                })
+
+            # Collect summary/reviews (\u70b9\u8bc4)
+            if summary:
+                for s in summary:
+                    content = (s.get("review") or {}).get("content") or ""
+                    if not content:
+                        continue
+                    all_notes.append({
+                        "bookId": bookId,
+                        "bookName": title,
+                        "author": author,
+                        "categories": book_categories,
+                        "chapterTitle": "",
+                        "noteType": REVIEW_TYPE,
+                        "markText": content,
+                        "abstract": "",
+                        "wereadUrl": book_weread_url,
+                        "readingProgress": book_reading_progress,
+                    })
+
+    # \u2500\u2500 Sync notes to the notes database \u2500\u2500
+    print("")
+    print("=" * 44)
+    print("Syncing notes to database...")
+    print("=" * 44)
+    try:
+        sync_notes_to_db(notes_db_id, all_notes)
+    except Exception as e:
+        print("[NotesDB] Error: " + str(e))
 
 
 def main(argv=None):

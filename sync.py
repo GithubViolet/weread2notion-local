@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, socket
 
 # === Config ===
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -6,10 +6,30 @@ env_file = os.path.join(script_dir, '.env')
 src_dir = os.path.join(script_dir, 'src')
 cli_module = os.path.join(src_dir, 'weread2notion', 'cli.py')
 
-# Bypass proxy
-os.environ['NO_PROXY'] = '*'
-os.environ['HTTP_PROXY'] = ''
-os.environ['HTTPS_PROXY'] = ''
+# Smart proxy detection: use proxy if available, bypass if not
+def detect_proxy(host='127.0.0.1', port=7890, timeout=1):
+    """Check if local proxy is running."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except (socket.error, OSError):
+        return False
+
+if detect_proxy():
+    proxy_url = 'http://127.0.0.1:7890'
+    os.environ['HTTP_PROXY'] = proxy_url
+    os.environ['HTTPS_PROXY'] = proxy_url
+    os.environ['http_proxy'] = proxy_url
+    os.environ['https_proxy'] = proxy_url
+    proxy_status = 'ON (127.0.0.1:7890)'
+else:
+    os.environ['NO_PROXY'] = '*'
+    os.environ['HTTP_PROXY'] = ''
+    os.environ['HTTPS_PROXY'] = ''
+    proxy_status = 'OFF (direct connection)'
 
 
 def wait():
@@ -27,6 +47,7 @@ print('')
 # Check Python
 print('[1/4] Checking environment...')
 print('  [OK] Python {}'.format(sys.version.split()[0]))
+print('  [OK] Proxy: {}'.format(proxy_status))
 
 # Check project files
 if not os.path.isfile(cli_module):
@@ -70,7 +91,10 @@ try:
     main(['sync'])
     print('-' * 44)
     print('')
-    print('[4/4] Sync completed! Check your Notion.')
+    print('[4/4] Sync completed!')
+    print('  - Books synced to Notion')
+    print('  - Personal Library dashboard updated')
+    print('  Check your Notion workspace!')
 except SystemExit as e:
     if e.code != 0:
         print('-' * 44)

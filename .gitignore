@@ -2,6 +2,7 @@
 *.egg-info/
 *.py[cod]
 .env
+sync_state.json
 OUT_FOLDER/
 __pycache__/
 build/
